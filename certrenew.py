@@ -1,54 +1,74 @@
-import requests
 import re
-import paramiko
 import json
-import datetime
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import pprint
+from socket import errorTab
+import paramiko
 
-now = datetime.datetime.now()
-datestring=(now.strftime('%Y%m%d'))
 
-hosts = [
-    {'PRI_hostname': 'F5VM','PRI_ip': '192.168.1.100','DR_hostname': 'F5VM','DR_IP': '192.168.1.100',}
-]
+# Read this article to find out more about managing the F5s certificates
+# https://support.f5.com/csp/article/K15462
+# Additionally note this very annoying quirk of the way F5 handles certs
+# ==================================
+# SSL certificates and keys are stored in the BIG-IP system's filestore directory. 
+# The BIG-IP filestore adds a unique identifier to each SSL certificate and key file name. 
+# For this reason, the SSL certificate and key filestore name will not be identical to the tmsh file name.
+# ===================================
 
-# make A GET for the requested path and respond with a dictonary of the response payload
-def F5_get_request(path, hostip):
-    url = 'https://{}/mgmt/tm/{}'.format(hostip,path)
-    auth = ('admin','admin')
-    request = requests.get(url, verify=False, auth=auth)
-    response = json.loads(request.text)
-    return response
-
-def F5_patch_request(path, hostip, profiles):
-    url = 'https://{}/mgmt/tm/{}'.format(hostip,path)
-    auth = ('admin','admin')
-    payload = json.dumps(profiles)
-    print(payload)
-    request = requests.patch(url, verify=False, auth=auth, data=payload)
-    response = json.loads(request.text)
-    return response
-
-def exportCrypto(host,username,password,certName,keyName,csslProfileName):
+#should really make this a better function at some point
+def getCrypto(host,username,password):
+   
+    #set up ssh
     ssh_client_from=paramiko.SSHClient()
     ssh_client_from.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh_client_from.connect(hostname=host['PRI_ip'],username=username,password=password)
-    stdin,stdout,stderr=ssh_client_from.exec_command("scp /config/filestore/files_d/Common_d/certificate_d/:Common:{}* {}@{}:/var/tmp".format(certName, username, host['DR_IP'] ))
-    print("scp /config/filestore/files_d/Common_d/certificate_key_d/:Common:{}* {}@{}:/var/tmp".format(certName, username, host['DR_IP'] ))
-    print(stdout.readlines())
-    print(stderr.readlines())
-    stdin,stdout,stderr=ssh_client_from.exec_command("scp /config/filestore/files_d/Common_d/certificate_key_d/:Common:{}* {}@{}:/var/tmp".format(keyName, username, host['DR_IP']))
-    print("scp /config/filestore/files_d/Common_d/certificate_d/:Common:{}* {}@{}:/var/tmp".format(keyName, username, host['DR_IP']))
-    print(stdout.readlines())
-    print(stderr.readlines())
-    stdin,stdout,stderr=ssh_client_from.exec_command("tmsh list ltm profile client-ssl {} one-line".format(csslProfileName))
-    profile_config = stdout.readlines()[0].replace('\n','')
-    print('tmsh list ltm profile client-ssl {} one-line'.format(csslProfileName))
-    print(stdout.readlines())
-    print(stderr.readlines())
+    ssh_client_from.connect(hostname=host,username=username,password=password)
+
+    #retrieve certs
+    stdin,stdout,stderr=ssh_client_from.exec_command("grep '' /dev/null /config/filestore/files_d/Common_d/certificate_d/* | grep -v -E '(default|bundle|f5)'")
+    print("grep '' /dev/null /config/filestore/files_d/Common_d/certificate_d/* | grep -v -E '(default|bundle|f5)'") 
+    crypto={}
+    crypto['certs'] = {}
+    crypto['certs']['all'] = (stdout.readlines())   
+    err = (stderr.readlines())
+
+    #dictify certs
+    #lines being parsed will look something like this
+    #/config/filestore/files_d/Common_d/certificate_d/:Common:testytest.crt_234361_1:KyqTgaLXeIVXDP0KPVx7ifJ5r/BMDnuPaqPkGRH9tt/6JHz1R2ebb4gbqFk=
+    for line in crypto['certs']['all']:
+        keyName = (re.findall(r':Common:[^:]+',line))[0]
+        if keyName not in crypto['certs']:
+            crypto['certs'][keyName] = {}
+            crypto['certs'][keyName]['shortname'] = (re.findall(r':Common:\S+\.crt',line))[0]
+            crypto['certs'][keyName]['certText'] = ''
+        crypto['certs'][keyName]['certText'] = crypto['certs'][keyName]['certText'] + (re.findall(r'[^:]+$',line))[0]
+    
+    #delete full certs list no longer required
+    crypto['certs'].pop('all', None)
+
+    #retrieve ssl keys
+    crypto['keys'] = {}
+    stdin,stdout,stderr=ssh_client_from.exec_command("grep '' /dev/null /config/filestore/files_d/Common_d/certificate_key_d/* | grep -v -E '(default|bundle|f5)'")
+    print("grep '' /dev/null /config/filestore/files_d/Common_d/certificate_key_d/* | grep -v -E '(default|bundle|f5)'") 
+    crypto['keys']['all'] = (stdout.readlines())
+    err = (stderr.readlines())
+
+    #dictify ssl keys
+    #lines being parsed will look something like this
+    #/config/filestore/files_d/Common_d/certificate_d/:Common:testytest.crt_234361_1:KyqTgaLXeIVXDP0KPVx7ifJ5r/BMDnuPaqPkGRH9tt/6JHz1R2ebb4gbqFk=
+    for line in crypto['keys']['all']:
+        keyName = (re.findall(r':Common:[^:]+',line))[0]
+        if keyName not in crypto['keys']:
+            crypto['keys'][keyName] = {}
+            crypto['keys'][keyName]['shortname'] = (re.findall(r':Common:\S+\.key',line))[0]
+            crypto['keys'][keyName]['keyText'] = ''
+        crypto['keys'][keyName]['keyText'] = crypto['keys'][keyName]['keyText'] + (re.findall(r'[^:]+$',line))[0]
+        
+
+    #delete full certs list no longer required
+    crypto['keys'].pop('all', None)
+
     ssh_client_from.close()
-    return profile_config
+    return(crypto)
+
 
 def importCrypto(profile_config,hostIP,username,password,certName,keyName):
     #target commands
@@ -77,31 +97,28 @@ def importCrypto(profile_config,hostIP,username,password,certName,keyName):
     print(stderr.readlines())
     ssh_client_target.close()
 
-#PERFORM LOGIC TO DECIDE WHICH CERTS NEED RENEWED
-needsReplaced = False
-for host in hosts:
-    sslProfilesPri = F5_get_request('ltm/profile/client-ssl',host['PRI_ip'])
-    sslProfilesDR = F5_get_request('ltm/profile/client-ssl',host['DR_IP'])
-    vipDR =  F5_get_request('ltm/virtual?expandSubcollections=true',host['DR_IP'])
-    for sslProfile in sslProfilesPri['items']:
-        if datestring in sslProfile['name']:
-            cert = sslProfile['certKeyChain'][0]['cert'].replace('/Common/','')
-            key = sslProfile['certKeyChain'][0]['key'].replace('/Common/','')
-            config = exportCrypto(host,'root','default',cert,key,sslProfile['name'])
-            importCrypto(config,host['PRI_ip'],'root','default',cert,key)
-            for vip in vipDR['items']:
-                if 'profilesReference' in vip:
-                    payloadProfiles = []
-                    for profile in vip['profilesReference']['items']:
-                        if sslProfile['name'] in profile['name']:
-                            print('match on vip'+vip['name'])
-                            payloadProfiles.append('/Common/clientSSL_REPLACE')
-                            needsReplaced = True
-                        else:
-                            payloadProfiles.append(profile['fullPath'])
-                    if needsReplaced:
-                        payload = {'profiles': payloadProfiles}
-                        print(payload)
-                        output = F5_patch_request('ltm/virtual/~Common~'+vip['name'],host['DR_IP'],payload)
-                        print(output)
-                        needsReplaced = False
+priCrypto = getCrypto('192.168.1.100','root','default')
+pprint.pprint(priCrypto)
+#secCrypto = getCrypto('192.168.1.100','root','default')
+
+#var { 
+#    certs {
+#        cert 1{
+#            certShortName : 'name'
+#            keyText : 'cert text'
+#        },
+#        cert 2 {
+#            certShortName : 'name'
+#            certText : 'cert text'
+#        }
+#    },
+#    keys {
+#       same format as certs
+#    }
+#}
+
+for key in priCrypto['certs'].keys():
+    #this will fail as 
+    print(key.items())
+    #if cert['shortname'] in secCrypto['certs']:
+    #    print('cert {} exists in both DCs'.format(cert['shortname']))
