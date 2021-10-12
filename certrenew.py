@@ -1,4 +1,7 @@
 import re
+import requests
+from requests.api import get
+from requests.auth import HTTPBasicAuth
 import json
 import pprint
 from socket import errorTab
@@ -14,6 +17,17 @@ import paramiko
 # For this reason, the SSL certificate and key filestore name will not be identical to the tmsh file name.
 # ===================================
 
+def F5_api_request(path,host,username,password):
+    auth  = HTTPBasicAuth(username, password)
+    url = 'https://{}/mgmt/tm/{}'.format(host,path)
+    request = requests.get(url, verify=False, auth = auth )
+    return json.loads(request.text)
+
+#find different certificates:
+def getCertsHash(host,username,password):
+    certs = F5_api_request('sys/crypto/cert',host,username,password)
+    return certs
+
 #should really make this a better function at some point
 def getCrypto(host,username,password):
    
@@ -24,7 +38,6 @@ def getCrypto(host,username,password):
 
     #retrieve certs
     stdin,stdout,stderr=ssh_client_from.exec_command("grep '' /dev/null /config/filestore/files_d/Common_d/certificate_d/* | grep -v -E '(default|bundle|f5)'")
-    print("grep '' /dev/null /config/filestore/files_d/Common_d/certificate_d/* | grep -v -E '(default|bundle|f5)'") 
     crypto={}
     crypto['certs'] = {}
     crypto['certs']['all'] = (stdout.readlines())   
@@ -34,12 +47,10 @@ def getCrypto(host,username,password):
     #lines being parsed will look something like this
     #/config/filestore/files_d/Common_d/certificate_d/:Common:testytest.crt_234361_1:KyqTgaLXeIVXDP0KPVx7ifJ5r/BMDnuPaqPkGRH9tt/6JHz1R2ebb4gbqFk=
     for line in crypto['certs']['all']:
-        keyName = (re.findall(r':Common:[^:]+',line))[0]
+        keyName = (re.findall(r':Common:\S+\.crt',line))[0].replace(':Common:','')
         if keyName not in crypto['certs']:
-            crypto['certs'][keyName] = {}
-            crypto['certs'][keyName]['shortname'] = (re.findall(r':Common:\S+\.crt',line))[0]
-            crypto['certs'][keyName]['certText'] = ''
-        crypto['certs'][keyName]['certText'] = crypto['certs'][keyName]['certText'] + (re.findall(r'[^:]+$',line))[0]
+            crypto['certs'][keyName] = ''
+        crypto['certs'][keyName]= crypto['certs'][keyName]+ (re.findall(r'[^:]+$',line))[0]
     
     #delete full certs list no longer required
     crypto['certs'].pop('all', None)
@@ -54,14 +65,12 @@ def getCrypto(host,username,password):
     #dictify ssl keys
     #lines being parsed will look something like this
     #/config/filestore/files_d/Common_d/certificate_d/:Common:testytest.crt_234361_1:KyqTgaLXeIVXDP0KPVx7ifJ5r/BMDnuPaqPkGRH9tt/6JHz1R2ebb4gbqFk=
+    
     for line in crypto['keys']['all']:
-        keyName = (re.findall(r':Common:[^:]+',line))[0]
+        keyName = (re.findall(r':Common:\S+\.key',line))[0].replace(':Common:','')
         if keyName not in crypto['keys']:
-            crypto['keys'][keyName] = {}
-            crypto['keys'][keyName]['shortname'] = (re.findall(r':Common:\S+\.key',line))[0]
-            crypto['keys'][keyName]['keyText'] = ''
-        crypto['keys'][keyName]['keyText'] = crypto['keys'][keyName]['keyText'] + (re.findall(r'[^:]+$',line))[0]
-        
+            crypto['keys'][keyName] = ''
+        crypto['keys'][keyName]= crypto['keys'][keyName]+ (re.findall(r'[^:]+$',line))[0]
 
     #delete full certs list no longer required
     crypto['keys'].pop('all', None)
@@ -69,56 +78,85 @@ def getCrypto(host,username,password):
     ssh_client_from.close()
     return(crypto)
 
-
-def importCrypto(profile_config,hostIP,username,password,certName,keyName):
+def uploadCrypto(hostIP,username,password,crypto):
     #target commands
     ssh_client_target=paramiko.SSHClient()
     ssh_client_target.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh_client_target.connect(hostname=hostIP,username=username,password=password)
-    stdin,stdout,stderr=ssh_client_target.exec_command("tmsh install sys crypto cert 3{} from-local-file /var/tmp/:Common:{}*".format(certName,certName))
-    print("tmsh install sys crypto cert 3{} from-local-file /var/tmp/:Common:{}*".format(certName,certName))
-    print(stdout.readlines())
-    print(stderr.readlines())
-    stdin,stdout,stderr=ssh_client_target.exec_command("tmsh install sys crypto key 3{} from-local-file /var/tmp/:Common:{}*".format(keyName,keyName))
-    print("tmsh install sys crypto key 3{} from-local-file /var/tmp/:Common:{}*".format(keyName,keyName))
-    print(stdout.readlines())
-    print(stderr.readlines())
-    #modify the config from new profile so it will fit on fake pair
-    profile_config = profile_config.replace('20210908','REPLACE')
-    profile_config = profile_config.replace('testSubject.','3testSubject.')
-    #these are required for all ssl certs (need to make sure there is no collateral damage)
-    profile_config = profile_config.replace('cert-key-chain {','cert-key-chain add {')
-    profile_config = re.sub(r'[^\s]+ false','',profile_config) 
-    print(profile_config)
+    ftp = ssh_client_target.open_sftp()
+    my_file = ftp.file('/var/tmp/'+ crypto[0], 'w') # 'w' will open the file for editing - it will truncate whatever was there before
+    my_file.write(crypto[1]) # write whatever you wish to the file
+    my_file.flush()
+    ftp.close()
 
-    stdin,stdout,stderr=ssh_client_target.exec_command('tmsh create ' + profile_config)
-    print('tmsh create ' + profile_config)
+    if 'crt' in crypto[0]:
+        stdin,stdout,stderr=ssh_client_target.exec_command("tmsh install sys crypto cert {} from-local-file /var/tmp/{}".format('autotest123',crypto[0]))
+    else:
+        stdin,stdout,stderr=ssh_client_target.exec_command("tmsh install sys crypto key {} from-local-file /var/tmp/{}".format('autotest123',crypto[0]))
+    print(stdout.readlines())
+    print(stderr.readlines())
+    stdin,stdout,stderr=ssh_client_target.exec_command('rm /var/tmp/'+ crypto[0])
     print(stdout.readlines())
     print(stderr.readlines())
     ssh_client_target.close()
 
-priCrypto = getCrypto('192.168.1.100','root','default')
-pprint.pprint(priCrypto)
-#secCrypto = getCrypto('192.168.1.100','root','default')
+priCerts = getCertsHash('192.168.1.100','admin','admin')
+secCerts = getCertsHash('192.168.1.100','admin','admin')
 
-#var { 
-#    certs {
-#        cert 1{
-#            certShortName : 'name'
-#            keyText : 'cert text'
-#        },
-#        cert 2 {
-#            certShortName : 'name'
-#            certText : 'cert text'
-#        }
-#    },
-#    keys {
-#       same format as certs
-#    }
-#}
-
-for key in priCrypto['certs'].keys():
-    #this will fail as 
-    print(key.items())
-    #if cert['shortname'] in secCrypto['certs']:
-    #    print('cert {} exists in both DCs'.format(cert['shortname']))
+# priCrypto = getCrypto('192.168.1.100','root','default')
+# secCrypto = getCrypto('192.168.1.100','root','default')
+#
+#
+#
+##for the sake of testing fake delete a cert
+#del secCrypto['certs']['testytest_20210907.crt']
+#del secCrypto['keys']['testytest_20210907.key']
+#
+##initalise list of items to be replicated
+#replicationItems=[]
+#
+##get certs from primary
+#cryptoNames = []
+#for name in priCrypto['certs'].keys():
+#    cryptoNames.append(name)
+#    print(name)
+#]
+#
+#
+## for certs on primary
+#for name in cryptoNames:
+#    #if cert on other device
+#    if name in secCrypto['certs']:
+#        #if cert text is not the same
+#        if not priCrypto['certs'][name] == secCrypto['certs'][name]:
+#            #add cert to items to be replicated
+#            replicationItems.append((name,priCrypto['certs'][name]))
+#
+#    #if cert is not on the other device then replicate
+#    else:
+#         replicationItems.append((name,priCrypto['certs'][name]))
+#
+#    #if there is a key for that cert on primary
+#    if name in priCrypto['keys']:
+#        # if that key doesnt exist in secondary replicate it
+#        if name not in secCrypto['keys'][name]:
+#             replicationItems.append((name,priCrypto['keys'][name]))
+#        #else if the values dont match then replicate
+#        elif not priCrypto['keys'][name] == secCrypto['keys'][name]:
+#            replicationItems.append(priCrypto['keys'][name])
+#
+#pprint.pprint(replicationItems)
+#
+##for item in replicationItems:
+##    uploadCrypto('192.168.1.100','root','default', item)
+#
+##var: { 
+##    certs: {
+##        cert 1: 'cert text',
+##        cert 2: 'cert text'
+##        }
+##    },
+##    keys : {
+##       same format as certs
+##    }
+##}
